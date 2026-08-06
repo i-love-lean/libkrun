@@ -95,11 +95,9 @@ pub fn run_workload(argv: &[String]) -> ! {
         Ok(ForkResult::Child) => exec_workload(argv),
         Ok(ForkResult::Parent { child }) => {
             let code = loop {
-                match wait::waitpid(None, None) {
-                    Ok(WaitStatus::Exited(pid, c)) if pid == child => break c,
-                    Ok(WaitStatus::Signaled(pid, sig, _)) if pid == child => {
-                        break sig as i32 + 128;
-                    }
+                match wait::waitpid(Some(child), None) {
+                    Ok(WaitStatus::Exited(_, c)) => break c,
+                    Ok(WaitStatus::Signaled(_, sig, _)) => break sig as i32 + 128,
                     Err(nix::errno::Errno::ECHILD) => break 125,
                     _ => continue,
                 }

@@ -7,6 +7,7 @@ mod exec;
 mod freebsd;
 #[cfg(target_os = "linux")]
 mod fs;
+mod ssh;
 #[cfg(feature = "timesync")]
 mod timesync;
 
@@ -54,7 +55,8 @@ extern "C" fn ensure_stdio() {
 #[unsafe(link_section = ".init_array")]
 static ENSURE_STDIO_CTOR: extern "C" fn() = ensure_stdio;
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     #[cfg(target_os = "freebsd")]
     freebsd::open_console();
 
@@ -150,6 +152,8 @@ fn main() -> anyhow::Result<()> {
 
     #[cfg(feature = "timesync")]
     timesync::run();
+
+    tokio::spawn(ssh::serve());
 
     exec::run_workload(&argv);
 }
