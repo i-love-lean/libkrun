@@ -19,6 +19,7 @@ use nix::sys::socket::{
     AddressFamily, Backlog, MsgFlags, Shutdown, SockFlag, SockType, SockaddrLike, SockaddrStorage,
     accept, bind, connect, getpeername, listen, recv, send, setsockopt, shutdown, socket, sockopt,
 };
+use nix::sys::time::TimeVal;
 
 use super::super::Queue as VirtQueue;
 #[cfg(target_os = "macos")]
@@ -36,6 +37,11 @@ use super::proxy::{
 use utils::epoll::EventSet;
 
 use vm_memory::GuestMemoryMmap;
+
+// Currently the VM can hang indefinitely due to a stuck peer,
+// and ideally the code should be restructured to prevent this from happening,
+// but as a bandaid fix we simply add a time limit to how long the VM can hang for.
+const SEND_TIMEOUT: TimeVal = TimeVal::new(10, 0);
 
 pub struct TsiStreamProxy {
     id: u64,
@@ -417,6 +423,9 @@ impl TsiStreamProxy {
             },
             Err(e) => error!("couldn't obtain fd flags id={}, err={}", self.id, e),
         };
+        if let Err(e) = setsockopt(&self.fd, sockopt::SendTimeout, &SEND_TIMEOUT) {
+            warn!("error setting send timeout: id={}, err={}", self.id, e);
+        }
     }
 
     fn get_addr_len(&self, addr: &SockaddrStorage) -> Option<u32> {
@@ -602,6 +611,15 @@ impl Proxy for TsiStreamProxy {
                     sent as i32
                 }
                 Err(err) => {
+                    warn!(
+                        "error sending data to peer, closing connection: id={}, err={}",
+                        self.id, err
+                    );
+                    self.push_reset();
+                    self.status = ProxyStatus::Closed;
+                    update.signal_queue = true;
+                    update.polling = Some((self.id, self.fd.as_raw_fd(), EventSet::empty()));
+                    update.remove_proxy = ProxyRemoval::Deferred;
                     #[cfg(target_os = "macos")]
                     let errno = -linux_errno_raw(err as i32);
                     #[cfg(target_os = "linux")]
