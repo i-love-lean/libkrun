@@ -1,4 +1,5 @@
 use nix::pty::OpenptyResult;
+use nix::sys::signal::{self, Signal};
 use russh::server::{Msg, Session};
 use russh::*;
 use std::collections::HashMap;
@@ -173,6 +174,26 @@ impl server::Handler for Server {
         _: &mut Session,
     ) -> Result<(), Self::Error> {
         let cmd = String::from_utf8_lossy(cmd_data);
+
+        // Handle the magic command sent by podman stop and crun kill.
+        if let Some(sig) = cmd
+            .strip_prefix('\u{1}')
+            .and_then(|r| r.strip_prefix("KRUN_STOP "))
+            .and_then(|s| s.trim().parse::<i32>().ok())
+        {
+            if let Some(pid) = crate::exec::WORKLOAD_PID.get() {
+                let _ = signal::kill(*pid, Signal::try_from(sig).unwrap_or(Signal::SIGTERM));
+            }
+            if let Some(s) = self.sd.get_mut(&id)
+                && let Some(ch) = s.ch.take()
+            {
+                let _ = ch.exit_status(0).await;
+                let _ = ch.eof().await;
+                let _ = ch.close().await;
+            }
+            return Ok(());
+        }
+
         let mut builder = if cmd.is_empty() {
             Command::new("sh")
         } else {

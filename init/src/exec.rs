@@ -9,6 +9,7 @@ use std::os::fd::AsRawFd;
 #[cfg(target_os = "linux")]
 use std::path::Path;
 use std::process;
+use std::sync::OnceLock;
 
 #[cfg(target_os = "linux")]
 use nix::fcntl::{self, OFlag};
@@ -19,7 +20,9 @@ use nix::sys::stat::Mode;
 #[cfg(target_os = "linux")]
 use nix::sys::statfs::{self, FsType};
 use nix::sys::wait::{self, WaitStatus};
-use nix::unistd::{self, ForkResult};
+use nix::unistd::{self, ForkResult, Pid};
+
+pub static WORKLOAD_PID: OnceLock<Pid> = OnceLock::new();
 
 #[cfg(target_os = "linux")]
 const KRUN_EXIT_CODE_IOCTL: libc::c_ulong = 0x7602;
@@ -94,6 +97,7 @@ pub fn run_workload(argv: &[String]) -> ! {
         }
         Ok(ForkResult::Child) => exec_workload(argv),
         Ok(ForkResult::Parent { child }) => {
+            let _ = WORKLOAD_PID.set(child);
             let code = loop {
                 match wait::waitpid(Some(child), None) {
                     Ok(WaitStatus::Exited(_, c)) => break c,
