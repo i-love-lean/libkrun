@@ -19,7 +19,6 @@ use nix::sys::socket::{
     AddressFamily, Backlog, MsgFlags, Shutdown, SockFlag, SockType, SockaddrLike, SockaddrStorage,
     accept, bind, connect, getpeername, listen, recv, send, setsockopt, shutdown, socket, sockopt,
 };
-use nix::sys::time::TimeVal;
 
 use super::super::Queue as VirtQueue;
 #[cfg(target_os = "macos")]
@@ -37,11 +36,6 @@ use super::proxy::{
 use utils::epoll::EventSet;
 
 use vm_memory::GuestMemoryMmap;
-
-// Currently the VM can hang indefinitely due to a stuck peer,
-// and ideally the code should be restructured to prevent this from happening,
-// but as a bandaid fix we simply add a time limit to how long the VM can hang for.
-const SEND_TIMEOUT: TimeVal = TimeVal::new(10, 0);
 
 pub struct TsiStreamProxy {
     id: u64,
@@ -64,6 +58,7 @@ pub struct TsiStreamProxy {
     push_cnt: Wrapping<u32>,
     pending_accepts: u64,
     unixsock_path: Option<PathBuf>,
+    pending_tx: Vec<u8>,
 }
 
 impl TsiStreamProxy {
@@ -144,6 +139,7 @@ impl TsiStreamProxy {
             push_cnt: Wrapping(0),
             pending_accepts: 0,
             unixsock_path: None,
+            pending_tx: Vec::new(),
         })
     }
 
@@ -182,6 +178,7 @@ impl TsiStreamProxy {
             push_cnt: Wrapping(0),
             pending_accepts: 0,
             unixsock_path: None,
+            pending_tx: Vec::new(),
         }
     }
 
@@ -415,7 +412,7 @@ impl TsiStreamProxy {
         match fcntl(&self.fd, FcntlArg::F_GETFL) {
             Ok(flags) => match OFlag::from_bits(flags) {
                 Some(flags) => {
-                    if let Err(e) = fcntl(&self.fd, FcntlArg::F_SETFL(flags & !OFlag::O_NONBLOCK)) {
+                    if let Err(e) = fcntl(&self.fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)) {
                         warn!("error switching to blocking: id={}, err={}", self.id, e);
                     }
                 }
@@ -423,9 +420,58 @@ impl TsiStreamProxy {
             },
             Err(e) => error!("couldn't obtain fd flags id={}, err={}", self.id, e),
         };
-        if let Err(e) = setsockopt(&self.fd, sockopt::SendTimeout, &SEND_TIMEOUT) {
-            warn!("error setting send timeout: id={}, err={}", self.id, e);
+    }
+
+    fn try_send(&mut self, update: &mut ProxyUpdate) {
+        if !self.pending_tx.is_empty() {
+            #[cfg(target_os = "macos")]
+            let flags = MsgFlags::empty();
+            #[cfg(target_os = "linux")]
+            let flags = MsgFlags::MSG_NOSIGNAL;
+
+            match send(self.fd.as_raw_fd(), &self.pending_tx, flags) {
+                Ok(sent) => {
+                    self.pending_tx.drain(..sent);
+                    self.tx_cnt += Wrapping(sent as u32);
+                }
+                Err(Errno::EWOULDBLOCK) => {}
+                Err(err) => {
+                    warn!(
+                        "error sending data to peer, closing connection: id={}, err={}",
+                        self.id, err
+                    );
+                    self.push_reset();
+                    self.status = ProxyStatus::Closed;
+                    update.signal_queue = true;
+                    update.polling = Some((self.id, self.fd.as_raw_fd(), EventSet::empty()));
+                    update.remove_proxy = ProxyRemoval::Deferred;
+                    return;
+                }
+            }
         }
+
+        if (self.tx_cnt - self.last_tx_cnt_sent).0 >= self.peer_buf_alloc / 2 {
+            debug!(
+                "sending credit update: id={}, tx_cnt={}, last_tx_cnt={}",
+                self.id, self.tx_cnt, self.last_tx_cnt_sent
+            );
+            self.last_tx_cnt_sent = self.tx_cnt;
+            // This packet goes to the connection.
+            let rx = MuxerRx::CreditUpdate {
+                local_port: self.local_port,
+                peer_port: self.peer_port,
+                fwd_cnt: self.tx_cnt.0,
+            };
+            push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+            update.signal_queue = true;
+        }
+
+        let evset = if self.pending_tx.is_empty() {
+            EventSet::IN
+        } else {
+            EventSet::IN | EventSet::OUT
+        };
+        update.polling = Some((self.id, self.fd.as_raw_fd(), evset));
     }
 
     fn get_addr_len(&self, addr: &SockaddrStorage) -> Option<u32> {
@@ -596,58 +642,12 @@ impl Proxy for TsiStreamProxy {
 
         let mut update = ProxyUpdate::default();
 
-        let ret = if let Some(buf) = pkt.buf() {
-            #[cfg(target_os = "macos")]
-            let flags = MsgFlags::empty();
-            #[cfg(target_os = "linux")]
-            let flags = MsgFlags::MSG_NOSIGNAL;
-
-            match send(self.fd.as_raw_fd(), buf, flags) {
-                Ok(sent) => {
-                    if sent != buf.len() {
-                        error!("couldn't set everything: buf={}, sent={}", buf.len(), sent);
-                    }
-                    self.tx_cnt += Wrapping(sent as u32);
-                    sent as i32
-                }
-                Err(err) => {
-                    warn!(
-                        "error sending data to peer, closing connection: id={}, err={}",
-                        self.id, err
-                    );
-                    self.push_reset();
-                    self.status = ProxyStatus::Closed;
-                    update.signal_queue = true;
-                    update.polling = Some((self.id, self.fd.as_raw_fd(), EventSet::empty()));
-                    update.remove_proxy = ProxyRemoval::Deferred;
-                    #[cfg(target_os = "macos")]
-                    let errno = -linux_errno_raw(err as i32);
-                    #[cfg(target_os = "linux")]
-                    let errno = -(err as i32);
-                    errno
-                }
-            }
-        } else {
-            -libc::EINVAL
+        let Some(buf) = pkt.buf() else {
+            return update;
         };
 
-        if ret > 0 && (self.tx_cnt - self.last_tx_cnt_sent).0 >= self.peer_buf_alloc / 2 {
-            debug!(
-                "sending credit update: id={}, tx_cnt={}, last_tx_cnt={}",
-                self.id, self.tx_cnt, self.last_tx_cnt_sent
-            );
-            self.last_tx_cnt_sent = self.tx_cnt;
-            // This packet goes to the connection.
-            let rx = MuxerRx::CreditUpdate {
-                local_port: pkt.dst_port(),
-                peer_port: pkt.src_port(),
-                fwd_cnt: self.tx_cnt.0,
-            };
-            push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
-            update.signal_queue = true;
-        }
-
-        debug!("sendmsg ret={ret}");
+        self.pending_tx.extend_from_slice(buf);
+        self.try_send(&mut update);
         update
     }
 
@@ -895,6 +895,8 @@ impl Proxy for TsiStreamProxy {
                 // Stop listening for events in the TCP socket until we receive
                 // OP_REQUEST and the vsock transport is fully established.
                 update.polling = Some((self.id(), self.fd.as_raw_fd(), EventSet::empty()));
+            } else if self.status == ProxyStatus::Connected {
+                self.try_send(&mut update);
             } else {
                 debug!("EventSet::OUT while not connecting");
             }
