@@ -1,11 +1,12 @@
 use nix::pty::OpenptyResult;
 use nix::sys::signal::{self, Signal};
+use nix::unistd::{self, ForkResult, Pid};
 use russh::server::{Msg, Session};
 use russh::*;
 use std::collections::HashMap;
-use std::os::fd::{FromRawFd, IntoRawFd, RawFd};
+use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     process::Command,
@@ -15,7 +16,39 @@ use tokio_vsock::{VMADDR_CID_ANY, VMADDR_CID_HOST, VsockAddr, VsockListener};
 
 const PORT: u32 = 0x6b72756e;
 
-pub async fn serve() -> anyhow::Result<()> {
+static WORKLOAD_PID: OnceLock<Pid> = OnceLock::new();
+
+pub fn run(pid_rx: OwnedFd) {
+    match unsafe { unistd::fork() } {
+        Ok(ForkResult::Child) => {
+            // Detach immediately so getty doesn't kill us
+            let _ = unistd::setsid();
+            spawn_pid_receiver(pid_rx);
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                unsafe { libc::_exit(1) };
+            };
+            let _ = rt.block_on(serve());
+            unsafe { libc::_exit(1) };
+        }
+        _ => {
+            // Parent or fork error: do nothing.
+        }
+    }
+}
+
+fn spawn_pid_receiver(pid_rx: OwnedFd) {
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4];
+        if unistd::read(&pid_rx, &mut buf) == Ok(4) {
+            let _ = WORKLOAD_PID.set(Pid::from_raw(i32::from_le_bytes(buf)));
+        }
+    });
+}
+
+async fn serve() -> anyhow::Result<()> {
     let config = Arc::new(russh::server::Config {
         keys: vec![russh::keys::PrivateKey::random(
             &mut rand::rng(),
@@ -181,7 +214,12 @@ impl server::Handler for Server {
             .and_then(|r| r.strip_prefix("KRUN_STOP "))
             .and_then(|s| s.trim().parse::<i32>().ok())
         {
-            if let Some(pid) = crate::exec::WORKLOAD_PID.get() {
+            if crate::exec::use_custom_pid1() {
+                // For some reason `poweroff` starts a shutdown but hangs at the end with
+                // "reboot: Power off not available: System halted instead",
+                // whereas `reboot` actually does a proper poweroff.
+                let _ = Command::new("reboot").spawn();
+            } else if let Some(pid) = WORKLOAD_PID.get() {
                 let _ = signal::kill(*pid, Signal::try_from(sig).unwrap_or(Signal::SIGTERM));
             }
             if let Some(s) = self.sd.get_mut(&id)

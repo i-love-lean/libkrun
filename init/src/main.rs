@@ -55,8 +55,7 @@ extern "C" fn ensure_stdio() {
 #[unsafe(link_section = ".init_array")]
 static ENSURE_STDIO_CTOR: extern "C" fn() = ensure_stdio;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     #[cfg(target_os = "freebsd")]
     freebsd::open_console();
 
@@ -153,7 +152,8 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(feature = "timesync")]
     timesync::run();
 
-    tokio::spawn(ssh::serve());
+    let (pid_rx, pid_tx) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)?;
+    ssh::run(pid_rx);
 
-    exec::run_workload(&argv);
+    exec::run_workload(&argv, pid_tx);
 }

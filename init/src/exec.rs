@@ -6,10 +6,10 @@ use std::fs;
 use std::mem;
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
+use std::os::fd::OwnedFd;
 #[cfg(target_os = "linux")]
 use std::path::Path;
 use std::process;
-use std::sync::OnceLock;
 
 #[cfg(target_os = "linux")]
 use nix::fcntl::{self, OFlag};
@@ -20,9 +20,7 @@ use nix::sys::stat::Mode;
 #[cfg(target_os = "linux")]
 use nix::sys::statfs::{self, FsType};
 use nix::sys::wait::{self, WaitStatus};
-use nix::unistd::{self, ForkResult, Pid};
-
-pub static WORKLOAD_PID: OnceLock<Pid> = OnceLock::new();
+use nix::unistd::{self, ForkResult};
 
 #[cfg(target_os = "linux")]
 const KRUN_EXIT_CODE_IOCTL: libc::c_ulong = 0x7602;
@@ -82,11 +80,15 @@ pub fn set_exit_code(code: i32) {
 #[cfg(not(target_os = "linux"))]
 pub fn set_exit_code(_code: i32) {}
 
-pub fn run_workload(argv: &[String]) -> ! {
-    // Match the C init which checked *env_init_pid1 == '1' (first-byte prefix),
-    // accepting "1", "10", "1\n", etc.  Exact equality with "1" would reject
-    // values that arrive with a trailing newline.
-    if env::var("KRUN_INIT_PID1").is_ok_and(|v| v.starts_with('1')) {
+/// Matches the C init which checked *env_init_pid1 == '1' (first-byte
+/// prefix), accepting "1", "10", "1\n", etc.  Exact equality with "1" would
+/// reject values that arrive with a trailing newline.
+pub fn use_custom_pid1() -> bool {
+    env::var("KRUN_INIT_PID1").is_ok_and(|v| v.starts_with('1'))
+}
+
+pub fn run_workload(argv: &[String], pid_tx: OwnedFd) -> ! {
+    if use_custom_pid1() {
         exec_workload(argv);
     }
 
@@ -97,7 +99,7 @@ pub fn run_workload(argv: &[String]) -> ! {
         }
         Ok(ForkResult::Child) => exec_workload(argv),
         Ok(ForkResult::Parent { child }) => {
-            let _ = WORKLOAD_PID.set(child);
+            let _ = unistd::write(&pid_tx, &child.as_raw().to_le_bytes());
             let code = loop {
                 match wait::waitpid(Some(child), None) {
                     Ok(WaitStatus::Exited(_, c)) => break c,
