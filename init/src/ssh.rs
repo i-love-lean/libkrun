@@ -56,6 +56,8 @@ async fn serve() -> anyhow::Result<()> {
         )?],
         // The default of 100 causes hangs when you send more than 100 environment variables (i.e. in CI).
         channel_buffer_size: 10000,
+        // Don't remove idle connections
+        inactivity_timeout: None,
         ..Default::default()
     });
     let vsl = VsockListener::bind(VsockAddr::new(VMADDR_CID_ANY, PORT))?;
